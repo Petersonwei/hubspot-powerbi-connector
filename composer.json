@@ -1,0 +1,15 @@
+{
+    "name": "your-name/hubspot-connector",
+    "description": "Power BI HubSpot Connector",
+    "type": "project",
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "config": {
+        "platform": {
+            "php": "8.0"
+        }
+    }
+}
