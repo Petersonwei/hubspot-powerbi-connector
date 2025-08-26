@@ -45,12 +45,44 @@ function auth($headers) {
  * @return array - Returns an array of records fetched from the API.
  */
 function get_records($object, $params) {
-    // Extract the HubSpot API key and remove it from the parameters
-    $hubspot_key = $params['hapikey'];
-    unset($params['hapikey']);
+    // Handle OAuth token vs API key
+    $hubspot_key = null;
+    if (isset($params['hapikey'])) {
+        // Traditional API key approach
+        $hubspot_key = $params['hapikey'];
+        unset($params['hapikey']);
+    } else {
+        // OAuth approach - read token from storage
+        $oauth_token_file = '/tmp/hubspot_oauth_token';
+        if (file_exists($oauth_token_file)) {
+            $hubspot_key = trim(file_get_contents($oauth_token_file));
+        } else {
+            return ["error" => "No OAuth token found. Please complete OAuth flow first."];
+        }
+    }
 
     // Base URL for the HubSpot API
     $url = 'https://api.hubapi.com/crm/v3/';
+
+    // Special handling for OAuth token endpoint
+    if ($object === 'oauth/v1/token') {
+        $url = 'https://api.hubapi.com/';
+        $url .= $object;
+        
+        // For OAuth token exchange, we need to POST the data
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/x-www-form-urlencoded'
+        ]);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        
+        $output = curl_exec($ch);
+        curl_close($ch);
+        
+        return json_decode($output, true);
+    }
 
     // Check if the object type is one of the supported types for 'objects' endpoint
     if (in_array($object, [
@@ -144,19 +176,95 @@ function main(array $args) {
         unset($params[$param]); // Remove these from the parameters array
     }
 
-    // Handle the 'getRecords' action
-    if ($action === "getRecords") {
-        // If 'properties' is '*', fetch all properties for the object
-        // This may not work due to server resource limitations or HubSpot API limitations when dealing with very long strings.
-        if (isset($params['properties']) && $params['properties'] === "*") {
-            $properties = get_records("properties/{$object}", $params);
-            $params['properties'] = implode(",", array_column($properties, 'name'));
-        }
-        // Fetch records based on the object and parameters, and convert to JSON
-        $result = json_encode(get_records($object, $params));
-    } else {
-        // If the action is invalid, return an error response
-        $result = json_encode(["error" => "Invalid action"]);
+    // Handle different actions using switch statement
+    switch ($action) {
+        case "authorize":
+            // 1) Redirect user to HubSpot consent screen
+            $clientId = getenv("HUBSPOT_CLIENT_ID");
+            $redirect = urlencode(getenv("OAUTH_REDIRECT_URI"));
+            $scopes = "crm.objects.contacts.read crm.objects.deals.read crm.objects.companies.read crm.objects.tasks.read crm.objects.meetings.read crm.objects.calls.read crm.objects.tickets.read";
+            
+            if (!$clientId || !$redirect) {
+                $result = json_encode(["error" => "OAuth environment variables not configured"]);
+                break;
+            }
+            
+            $authUrl = "https://app.hubspot.com/oauth/authorize"
+                     . "?client_id={$clientId}"
+                     . "&scope=" . urlencode($scopes)
+                     . "&redirect_uri={$redirect}";
+            
+            // Return redirect URL in response if headers are set (API call)
+            if (isset($args['http']['headers'])) {
+                $result = json_encode(["redirect_url" => $authUrl]);
+            } else {
+                // Direct browser access - redirect immediately
+                header("Location: " . $authUrl);
+                exit;
+            }
+            break;
+
+        case "callback":
+            // 2) Exchange code for access token
+            if (!isset($_GET["code"])) {
+                $result = json_encode(["error" => "No authorization code received"]);
+                break;
+            }
+            
+            $code = $_GET["code"];
+            $clientId = getenv("HUBSPOT_CLIENT_ID");
+            $secret = getenv("HUBSPOT_CLIENT_SECRET");
+            $redirect = getenv("OAUTH_REDIRECT_URI");
+            
+            if (!$clientId || !$secret || !$redirect) {
+                $result = json_encode(["error" => "OAuth environment variables not configured"]);
+                break;
+            }
+            
+            $tokenResponse = get_records("oauth/v1/token", [
+                "grant_type" => "authorization_code",
+                "client_id" => $clientId,
+                "client_secret" => $secret,
+                "redirect_uri" => $redirect,
+                "code" => $code
+            ]);
+            
+            if (isset($tokenResponse["access_token"])) {
+                // Store the access token securely
+                $oauth_token_file = '/tmp/hubspot_oauth_token';
+                file_put_contents($oauth_token_file, $tokenResponse["access_token"]);
+                
+                // Also store refresh token if available
+                if (isset($tokenResponse["refresh_token"])) {
+                    file_put_contents('/tmp/hubspot_refresh_token', $tokenResponse["refresh_token"]);
+                }
+                
+                $result = json_encode([
+                    "message" => "OAuth setup complete. Access token stored successfully.",
+                    "expires_in" => $tokenResponse["expires_in"] ?? null
+                ]);
+            } else {
+                $result = json_encode([
+                    "error" => "Failed to obtain access token",
+                    "details" => $tokenResponse
+                ]);
+            }
+            break;
+
+        case "getRecords":
+            // Original getRecords functionality
+            if (isset($params['properties']) && $params['properties'] === "*") {
+                $properties = get_records("properties/{$object}", $params);
+                $params['properties'] = implode(",", array_column($properties, 'name'));
+            }
+            // Fetch records based on the object and parameters, and convert to JSON
+            $result = json_encode(get_records($object, $params));
+            break;
+
+        default:
+            // If the action is invalid, return an error response
+            $result = json_encode(["error" => "Invalid action. Supported actions: authorize, callback, getRecords"]);
+            break;
     }
 
     // Return the JSON response if headers are set; otherwise, print it
