@@ -185,7 +185,21 @@ function main(array $args) {
             // 1) Redirect user to HubSpot consent screen
             $clientId = getenv("HUBSPOT_CLIENT_ID");
             $redirect = urlencode(getenv("OAUTH_REDIRECT_URI"));
-            $scopes = "crm.objects.contacts.read crm.objects.deals.read crm.objects.companies.read crm.objects.tasks.read crm.objects.meetings.read crm.objects.calls.read crm.objects.tickets.read";
+            
+            // Get scopes from environment variable or use default
+            $envScopes = getenv("OAUTH_SCOPES");
+            if ($envScopes) {
+                $scopes = $envScopes;
+            } else {
+                // Default scopes matching your HubSpot app configuration
+                $scopes = implode(" ", [
+                    "crm.objects.companies.read",
+                    "crm.objects.contacts.read", 
+                    "crm.objects.deals.read",
+                    "crm.objects.owners.read",
+                    "oauth"
+                ]);
+            }
             
             if (!$clientId || !$redirect) {
                 $result = json_encode(["error" => "OAuth environment variables not configured"]);

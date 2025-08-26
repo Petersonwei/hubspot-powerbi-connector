@@ -8,7 +8,10 @@ Set these environment variables in your hosting platform (Render, Heroku, etc.):
 HUBSPOT_CLIENT_ID=your-client-id-here
 HUBSPOT_CLIENT_SECRET=your-client-secret-here
 OAUTH_REDIRECT_URI=https://your-deployed-url.com/?action=callback
+OAUTH_SCOPES=crm.objects.companies.read crm.objects.contacts.read crm.objects.deals.read crm.objects.owners.read oauth
 ```
+
+**Note:** The `OAUTH_SCOPES` variable is optional. If not set, the connector will use the default scopes listed above.
 
 ## HubSpot App Setup
 
