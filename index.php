@@ -160,13 +160,6 @@ function main(array $args) {
     // Get HTTP headers from the request, either from $args or from the global request
     $headers = isset($args['http']['headers']) ? $args['http']['headers'] : getallheaders();
 
-    // Authorization check using the auth function
-    if (function_exists('auth') && !auth($headers)) {
-        $error = json_encode(["error_code" => "401", "error_description" => "Unauthorized"]);
-        // Return the error response as JSON if headers are set; otherwise, print it
-        return isset($args['http']['headers']) ? ["body" => $error] : print($error);
-    }
-
     // Filter parameters from the arguments, keeping only scalar values
     $params = array_filter($args, 'is_scalar');
     
@@ -174,6 +167,16 @@ function main(array $args) {
     foreach(['action', 'object'] as $param){
         ${$param} = isset($params[$param]) ? $params[$param] : null;
         unset($params[$param]); // Remove these from the parameters array
+    }
+
+    // Skip auth for OAuth handshake actions
+    if (!in_array($action, ["authorize", "callback"], true)) {
+        // Authorization check using the auth function
+        if (function_exists('auth') && !auth($headers)) {
+            $error = json_encode(["error_code" => "401", "error_description" => "Unauthorized"]);
+            // Return the error response as JSON if headers are set; otherwise, print it
+            return isset($args['http']['headers']) ? ["body" => $error] : print($error);
+        }
     }
 
     // Handle different actions using switch statement
