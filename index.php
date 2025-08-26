@@ -53,12 +53,15 @@ function get_records($object, $params) {
         unset($params['hapikey']);
     } else {
         // OAuth approach - read token from storage
-        $oauth_token_file = '/tmp/hubspot_oauth_token';
-        if (file_exists($oauth_token_file)) {
-            $hubspot_key = trim(file_get_contents($oauth_token_file));
-        } else {
+        $oauthFile = "/tmp/hubspot_oauth.json";
+        if (!file_exists($oauthFile)) {
             return ["error" => "No OAuth token found. Please complete OAuth flow first."];
         }
+        $oauthData = json_decode(file_get_contents($oauthFile), true);
+        if (empty($oauthData["access_token"])) {
+            return ["error" => "Invalid OAuth token data. Please complete OAuth flow again."];
+        }
+        $hubspot_key = $oauthData["access_token"];
     }
 
     // Base URL for the HubSpot API
@@ -213,7 +216,11 @@ function main(array $args) {
             
             // Return redirect URL in response if headers are set (API call)
             if (isset($args['http']['headers'])) {
-                $result = json_encode(["redirect_url" => $authUrl]);
+                $result = json_encode([
+                    "redirect_url" => $authUrl,
+                    "scopes_used" => $scopes,
+                    "scopes_source" => $envScopes ? "environment" : "default"
+                ]);
             } else {
                 // Direct browser access - redirect immediately
                 header("Location: " . $authUrl);
@@ -224,8 +231,7 @@ function main(array $args) {
         case "callback":
             // 2) Exchange code for access token
             if (!isset($_GET["code"])) {
-                $result = json_encode(["error" => "No authorization code received"]);
-                break;
+                exit("Error: no code provided");
             }
             
             $code = $_GET["code"];
@@ -234,39 +240,46 @@ function main(array $args) {
             $redirect = getenv("OAUTH_REDIRECT_URI");
             
             if (!$clientId || !$secret || !$redirect) {
-                $result = json_encode(["error" => "OAuth environment variables not configured"]);
-                break;
+                exit("Error: OAuth environment variables not configured");
             }
             
-            $tokenResponse = get_records("oauth/v1/token", [
-                "grant_type" => "authorization_code",
-                "client_id" => $clientId,
+            // 2) Exchange code for tokens
+            $tokenUrl = "https://api.hubapi.com/oauth/v1/token";
+            $postData = http_build_query([
+                "grant_type"    => "authorization_code",
+                "client_id"     => $clientId,
                 "client_secret" => $secret,
-                "redirect_uri" => $redirect,
-                "code" => $code
+                "redirect_uri"  => $redirect,
+                "code"          => $code
             ]);
-            
-            if (isset($tokenResponse["access_token"])) {
-                // Store the access token securely
-                $oauth_token_file = '/tmp/hubspot_oauth_token';
-                file_put_contents($oauth_token_file, $tokenResponse["access_token"]);
-                
-                // Also store refresh token if available
-                if (isset($tokenResponse["refresh_token"])) {
-                    file_put_contents('/tmp/hubspot_refresh_token', $tokenResponse["refresh_token"]);
-                }
-                
-                $result = json_encode([
-                    "message" => "OAuth setup complete. Access token stored successfully.",
-                    "expires_in" => $tokenResponse["expires_in"] ?? null
-                ]);
-            } else {
-                $result = json_encode([
-                    "error" => "Failed to obtain access token",
-                    "details" => $tokenResponse
-                ]);
+
+            $ch = curl_init($tokenUrl);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ["Content-Type: application/x-www-form-urlencoded"]);
+            $response = curl_exec($ch);
+            if (curl_errno($ch)) {
+                exit("cURL error: " . curl_error($ch));
             }
-            break;
+            curl_close($ch);
+
+            $data = json_decode($response, true);
+            if (empty($data["access_token"])) {
+                exit("Failed to obtain access token: " . ($data["error"] ?? "unknown error"));
+            }
+
+            // 3) Persist tokens securely
+            // Here we write to /tmp; in production use a database or secret store
+            file_put_contents("/tmp/hubspot_oauth.json", json_encode([
+                "access_token"  => $data["access_token"],
+                "refresh_token" => $data["refresh_token"] ?? null,
+                "expires_in"    => $data["expires_in"] ?? null,
+                "obtained_at"   => time()
+            ]));
+
+            echo "OAuth setup complete. You can now close this window.";
+            exit;
 
         case "getRecords":
             // Original getRecords functionality
