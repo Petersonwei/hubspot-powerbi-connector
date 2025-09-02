@@ -166,19 +166,29 @@ function get_valid_token() {
  * @return array - Returns an array of records fetched from the API.
  */
 function get_records($object, $params) {
-    // Handle OAuth token vs API key
+    // Handle different authentication methods
     $hubspot_key = null;
     $usingOAuth = false;
     
-    if (isset($params['hapikey'])) {
-        // Traditional API key approach
+    // Priority 1: Private App access token parameter
+    if (isset($params['access_token'])) {
+        $hubspot_key = $params['access_token'];
+        unset($params['access_token']);
+    }
+    // Priority 2: Private App token from environment variable
+    else if (getenv("HUBSPOT_PRIVATE_ACCESS_TOKEN")) {
+        $hubspot_key = getenv("HUBSPOT_PRIVATE_ACCESS_TOKEN");
+    }
+    // Priority 3: Legacy API key parameter
+    else if (isset($params['hapikey'])) {
         $hubspot_key = $params['hapikey'];
         unset($params['hapikey']);
-    } else {
-        // OAuth approach - get valid token (auto-refresh if needed)
+    }
+    // Priority 4: OAuth approach (fallback for Public Apps)
+    else {
         $hubspot_key = get_valid_token();
         if ($hubspot_key === false) {
-            return ["error" => "No valid OAuth token available. Please complete OAuth flow first."];
+            return ["error" => "No authentication found. Please provide: access_token parameter, set HUBSPOT_PRIVATE_ACCESS_TOKEN environment variable, or complete OAuth flow."];
         }
         $usingOAuth = true;
     }
@@ -448,47 +458,66 @@ function main(array $args) {
             break;
 
         case "checkToken":
-            // Check OAuth token status without making API calls
-            $oauthFile = "/tmp/hubspot_oauth.json";
-            if (!file_exists($oauthFile)) {
-                $result = json_encode([
-                    "valid" => false,
-                    "error" => "No OAuth token found",
-                    "requires_auth" => true
-                ]);
-            } else {
-                $oauthData = json_decode(file_get_contents($oauthFile), true);
-                if (empty($oauthData)) {
-                    $result = json_encode([
-                        "valid" => false,
-                        "error" => "Invalid token data",
-                        "requires_auth" => true
-                    ]);
-                } else {
-                    $isValid = is_token_valid($oauthData);
-                    $hasRefreshToken = !empty($oauthData["refresh_token"]);
-                    
-                    $tokenStatus = [
-                        "valid" => $isValid,
-                        "has_refresh_token" => $hasRefreshToken,
-                        "expires_in" => isset($oauthData["expires_in"]) ? $oauthData["expires_in"] : null,
-                        "obtained_at" => isset($oauthData["obtained_at"]) ? $oauthData["obtained_at"] : null
+            // Check authentication status for all methods
+            $authStatus = [
+                "timestamp" => date('Y-m-d H:i:s'),
+                "methods_checked" => []
+            ];
+            
+            // Check Private App access token parameter
+            if (isset($params['access_token'])) {
+                $authStatus["methods_checked"][] = "access_token_parameter";
+                $authStatus["auth_method"] = "Private App (parameter)";
+                $authStatus["valid"] = true;
+                $authStatus["token_type"] = "Private App Access Token";
+                $authStatus["expires"] = "Never (Private App tokens are permanent)";
+            }
+            // Check environment variable
+            else if (getenv("HUBSPOT_PRIVATE_ACCESS_TOKEN")) {
+                $authStatus["methods_checked"][] = "environment_variable";
+                $authStatus["auth_method"] = "Private App (environment)";
+                $authStatus["valid"] = true;
+                $authStatus["token_type"] = "Private App Access Token";
+                $authStatus["expires"] = "Never (Private App tokens are permanent)";
+                $authStatus["env_var_set"] = true;
+            }
+            // Check OAuth token
+            else {
+                $oauthFile = "/tmp/hubspot_oauth.json";
+                $authStatus["methods_checked"][] = "oauth_file";
+                
+                if (!file_exists($oauthFile)) {
+                    $authStatus["valid"] = false;
+                    $authStatus["error"] = "No authentication found";
+                    $authStatus["suggestions"] = [
+                        "Set HUBSPOT_PRIVATE_ACCESS_TOKEN environment variable",
+                        "Pass access_token parameter",
+                        "Complete OAuth flow for Public Apps"
                     ];
-                    
-                    if (isset($oauthData["obtained_at"]) && isset($oauthData["expires_in"])) {
-                        $expiresAt = $oauthData["obtained_at"] + $oauthData["expires_in"];
-                        $tokenStatus["expires_at"] = date('Y-m-d H:i:s', $expiresAt);
-                        $tokenStatus["seconds_until_expiry"] = max(0, $expiresAt - time());
+                } else {
+                    $oauthData = json_decode(file_get_contents($oauthFile), true);
+                    if (empty($oauthData)) {
+                        $authStatus["valid"] = false;
+                        $authStatus["error"] = "Invalid OAuth token data";
+                    } else {
+                        $isValid = is_token_valid($oauthData);
+                        $hasRefreshToken = !empty($oauthData["refresh_token"]);
+                        
+                        $authStatus["valid"] = $isValid;
+                        $authStatus["auth_method"] = "OAuth (Public App)";
+                        $authStatus["has_refresh_token"] = $hasRefreshToken;
+                        $authStatus["expires_in"] = isset($oauthData["expires_in"]) ? $oauthData["expires_in"] : null;
+                        
+                        if (isset($oauthData["obtained_at"]) && isset($oauthData["expires_in"])) {
+                            $expiresAt = $oauthData["obtained_at"] + $oauthData["expires_in"];
+                            $authStatus["expires_at"] = date('Y-m-d H:i:s', $expiresAt);
+                            $authStatus["seconds_until_expiry"] = max(0, $expiresAt - time());
+                        }
                     }
-                    
-                    if (!$isValid) {
-                        $tokenStatus["can_refresh"] = $hasRefreshToken;
-                        $tokenStatus["requires_auth"] = !$hasRefreshToken;
-                    }
-                    
-                    $result = json_encode($tokenStatus);
                 }
             }
+            
+            $result = json_encode($authStatus, JSON_PRETTY_PRINT);
             break;
 
         default:
