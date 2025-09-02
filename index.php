@@ -328,8 +328,8 @@ function main(array $args) {
         unset($params[$param]); // Remove these from the parameters array
     }
 
-    // Skip auth for OAuth handshake actions
-    if (!in_array($action, ["authorize", "callback"], true)) {
+    // Skip auth for OAuth handshake actions and token checking
+    if (!in_array($action, ["authorize", "callback", "checkToken"], true)) {
         // Authorization check using the auth function
         if (function_exists('auth') && !auth($headers)) {
             $error = json_encode(["error_code" => "401", "error_description" => "Unauthorized"]);
