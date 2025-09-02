@@ -38,6 +38,127 @@ function auth($headers) {
 }
 
 /**
+ * Validates if the OAuth token is still valid based on expiration time.
+ * 
+ * @param array $tokenData - The token data array containing access_token, expires_in, and obtained_at
+ * @return bool - Returns true if token is valid, false if expired
+ */
+function is_token_valid($tokenData) {
+    if (empty($tokenData) || !isset($tokenData['obtained_at']) || !isset($tokenData['expires_in'])) {
+        return false;
+    }
+    
+    // Check if token is expired with 5-minute safety buffer (300 seconds)
+    $currentTime = time();
+    $tokenExpiryTime = $tokenData['obtained_at'] + $tokenData['expires_in'] - 300;
+    
+    return $currentTime < $tokenExpiryTime;
+}
+
+/**
+ * Refreshes the HubSpot OAuth access token using the refresh token.
+ * 
+ * @param string $refresh_token - The refresh token to use for getting a new access token
+ * @return array|false - Returns new token data on success, false on failure
+ */
+function refresh_access_token($refresh_token) {
+    $clientId = getenv("HUBSPOT_CLIENT_ID");
+    $clientSecret = getenv("HUBSPOT_CLIENT_SECRET");
+    $redirectUri = getenv("OAUTH_REDIRECT_URI");
+    
+    if (!$clientId || !$clientSecret || !$redirectUri) {
+        error_log("OAuth environment variables not configured for token refresh");
+        return false;
+    }
+    
+    $tokenUrl = "https://api.hubapi.com/oauth/v1/token";
+    $postData = http_build_query([
+        "grant_type" => "refresh_token",
+        "client_id" => $clientId,
+        "client_secret" => $clientSecret,
+        "redirect_uri" => $redirectUri,
+        "refresh_token" => $refresh_token
+    ]);
+    
+    $ch = curl_init($tokenUrl);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postData);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ["Content-Type: application/x-www-form-urlencoded"]);
+    
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    
+    if (curl_errno($ch)) {
+        error_log("cURL error during token refresh: " . curl_error($ch));
+        curl_close($ch);
+        return false;
+    }
+    curl_close($ch);
+    
+    if ($httpCode !== 200) {
+        error_log("Token refresh failed with HTTP code: " . $httpCode);
+        return false;
+    }
+    
+    $data = json_decode($response, true);
+    if (empty($data["access_token"])) {
+        error_log("Failed to refresh access token: " . ($data["error"] ?? "unknown error"));
+        return false;
+    }
+    
+    // Return new token data with timestamp
+    return [
+        "access_token" => $data["access_token"],
+        "refresh_token" => $data["refresh_token"] ?? $refresh_token,
+        "expires_in" => $data["expires_in"] ?? 1800, // Default 30 minutes
+        "obtained_at" => time()
+    ];
+}
+
+/**
+ * Gets a valid access token, automatically refreshing if needed.
+ * 
+ * @return string|false - Returns valid access token on success, false on failure
+ */
+function get_valid_token() {
+    $oauthFile = "/tmp/hubspot_oauth.json";
+    
+    if (!file_exists($oauthFile)) {
+        error_log("No OAuth token file found");
+        return false;
+    }
+    
+    $oauthData = json_decode(file_get_contents($oauthFile), true);
+    if (empty($oauthData)) {
+        error_log("Invalid OAuth token data");
+        return false;
+    }
+    
+    // Check if token is still valid
+    if (is_token_valid($oauthData)) {
+        return $oauthData["access_token"];
+    }
+    
+    // Token is expired or about to expire, refresh it
+    if (empty($oauthData["refresh_token"])) {
+        error_log("No refresh token available");
+        return false;
+    }
+    
+    $newTokenData = refresh_access_token($oauthData["refresh_token"]);
+    if ($newTokenData === false) {
+        error_log("Failed to refresh token");
+        return false;
+    }
+    
+    // Save new token data
+    file_put_contents($oauthFile, json_encode($newTokenData));
+    
+    return $newTokenData["access_token"];
+}
+
+/**
  * Fetches records from the HubSpot API based on the provided object type and parameters.
  *
  * @param string $object - The type of object to fetch (e.g., companies, contacts, deals).
@@ -47,21 +168,19 @@ function auth($headers) {
 function get_records($object, $params) {
     // Handle OAuth token vs API key
     $hubspot_key = null;
+    $usingOAuth = false;
+    
     if (isset($params['hapikey'])) {
         // Traditional API key approach
         $hubspot_key = $params['hapikey'];
         unset($params['hapikey']);
     } else {
-        // OAuth approach - read token from storage
-        $oauthFile = "/tmp/hubspot_oauth.json";
-        if (!file_exists($oauthFile)) {
-            return ["error" => "No OAuth token found. Please complete OAuth flow first."];
+        // OAuth approach - get valid token (auto-refresh if needed)
+        $hubspot_key = get_valid_token();
+        if ($hubspot_key === false) {
+            return ["error" => "No valid OAuth token available. Please complete OAuth flow first."];
         }
-        $oauthData = json_decode(file_get_contents($oauthFile), true);
-        if (empty($oauthData["access_token"])) {
-            return ["error" => "Invalid OAuth token data. Please complete OAuth flow again."];
-        }
-        $hubspot_key = $oauthData["access_token"];
+        $usingOAuth = true;
     }
 
     // Base URL for the HubSpot API
@@ -110,12 +229,49 @@ function get_records($object, $params) {
     curl_setopt($ch, CURLOPT_HTTPHEADER, $headers); // Set the headers
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true); // Return the response as a string
 
-    // Execute the cURL request and close the session
+    // Execute the cURL request and get HTTP status code
     $output = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
+
+    // Handle 401 Unauthorized errors with automatic token refresh (OAuth only)
+    if ($httpCode === 401 && $usingOAuth) {
+        // Token likely expired, force refresh and retry once
+        $oauthFile = "/tmp/hubspot_oauth.json";
+        if (file_exists($oauthFile)) {
+            $oauthData = json_decode(file_get_contents($oauthFile), true);
+            if (!empty($oauthData["refresh_token"])) {
+                $newTokenData = refresh_access_token($oauthData["refresh_token"]);
+                if ($newTokenData !== false) {
+                    // Save new token and retry the request
+                    file_put_contents($oauthFile, json_encode($newTokenData));
+                    
+                    // Update the Authorization header with new token
+                    $headers[0] = 'Authorization:Bearer ' . $newTokenData["access_token"];
+                    
+                    // Retry the request with new token
+                    $ch = curl_init($url);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    $output = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    curl_close($ch);
+                }
+            }
+        }
+    }
 
     // Decode the JSON response from the API into a PHP array
     $result = json_decode($output, true);
+    
+    // Handle API errors
+    if ($httpCode >= 400) {
+        return [
+            "error" => "HubSpot API error",
+            "http_code" => $httpCode,
+            "response" => $result ?? $output
+        ];
+    }
 
     // Initialize an empty array to hold the records
     $records = [];
@@ -291,9 +447,53 @@ function main(array $args) {
             $result = json_encode(get_records($object, $params));
             break;
 
+        case "checkToken":
+            // Check OAuth token status without making API calls
+            $oauthFile = "/tmp/hubspot_oauth.json";
+            if (!file_exists($oauthFile)) {
+                $result = json_encode([
+                    "valid" => false,
+                    "error" => "No OAuth token found",
+                    "requires_auth" => true
+                ]);
+            } else {
+                $oauthData = json_decode(file_get_contents($oauthFile), true);
+                if (empty($oauthData)) {
+                    $result = json_encode([
+                        "valid" => false,
+                        "error" => "Invalid token data",
+                        "requires_auth" => true
+                    ]);
+                } else {
+                    $isValid = is_token_valid($oauthData);
+                    $hasRefreshToken = !empty($oauthData["refresh_token"]);
+                    
+                    $tokenStatus = [
+                        "valid" => $isValid,
+                        "has_refresh_token" => $hasRefreshToken,
+                        "expires_in" => isset($oauthData["expires_in"]) ? $oauthData["expires_in"] : null,
+                        "obtained_at" => isset($oauthData["obtained_at"]) ? $oauthData["obtained_at"] : null
+                    ];
+                    
+                    if (isset($oauthData["obtained_at"]) && isset($oauthData["expires_in"])) {
+                        $expiresAt = $oauthData["obtained_at"] + $oauthData["expires_in"];
+                        $tokenStatus["expires_at"] = date('Y-m-d H:i:s', $expiresAt);
+                        $tokenStatus["seconds_until_expiry"] = max(0, $expiresAt - time());
+                    }
+                    
+                    if (!$isValid) {
+                        $tokenStatus["can_refresh"] = $hasRefreshToken;
+                        $tokenStatus["requires_auth"] = !$hasRefreshToken;
+                    }
+                    
+                    $result = json_encode($tokenStatus);
+                }
+            }
+            break;
+
         default:
             // If the action is invalid, return an error response
-            $result = json_encode(["error" => "Invalid action. Supported actions: authorize, callback, getRecords"]);
+            $result = json_encode(["error" => "Invalid action. Supported actions: authorize, callback, getRecords, checkToken"]);
             break;
     }
 
